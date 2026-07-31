@@ -78,26 +78,54 @@ def sgo_path_to_filename(sgo_path: str) -> str:
     return re.sub(r"\.sgo$", "", base, flags=re.IGNORECASE) + ".json"
 
 
+def _extract_scalar_if_possible(donor_var: dict):
+    """If donor_var is already a plain scalar, return its value as-is.
+    If it's a "ptr" curve whose first element is a numeric scalar
+    (the base value of the curve, matching the convention used
+    throughout this game's data for tier-scalable stats), extract
+    that base value instead of the whole curve structure."""
+    if donor_var.get("type") != "ptr":
+        return donor_var.get("value")
+    values = donor_var.get("value") or []
+    if values and isinstance(values[0], dict) and values[0].get("type") == "double":
+        return values[0]["value"]
+    return None
+
+
 def apply_behavior_transplant(clone_sgo: dict, donor_sgo: dict, behavior_fields: List[str]) -> bool:
     donor_vars_by_name = {v["name"]: v for v in donor_sgo["variables"]}
     changed = False
     for i, var in enumerate(clone_sgo["variables"]):
         if var["name"] in behavior_fields and var["name"] in donor_vars_by_name:
             donor_var = donor_vars_by_name[var["name"]]
-            # Skip if the field's fundamental JSON structure differs
-            # between donor and recipient (e.g. plain "double" vs a
-            # "ptr"/array-wrapped value for the SAME field name) — found
-            # via real crash investigation: SecondaryFire_Parameter went
-            # from a plain double to a ptr-wrapped value on a real
-            # weapon that then crashed specifically on firing. Copying a
-            # value into a structurally different shape than the game
-            # expects for that field is a real risk even when our own
-            # code considers the copy "successful". Leaves the
-            # recipient's original value/structure in place instead.
-            if var.get("type") != donor_var.get("type"):
+            if var.get("type") == donor_var.get("type"):
+                clone_sgo["variables"][i] = copy.deepcopy(donor_var)
+                changed = True
                 continue
-            clone_sgo["variables"][i] = copy.deepcopy(donor_var)
-            changed = True
+            # Types differ. Found via a second real crash: a donor's
+            # AmmoExplosion was a "ptr" curve while the recipient's own
+            # was a plain "double" — our original type-safety fix
+            # correctly avoided structural corruption by skipping it,
+            # but that left AmmoClass="BombBullet02" (a real explosive)
+            # paired with AmmoExplosion=0 (a scalar meaning "never
+            # explodes") — the exact same logical contradiction as the
+            # FIRST crash, just caused by our own safety mechanism this
+            # time. Rather than only "same type or skip", extract a
+            # real usable scalar from a donor curve when the recipient
+            # needs one — preserves the actual meaningful value while
+            # staying fully safe (the recipient still gets a valid
+            # plain double, exactly what its own code expects there).
+            if var.get("type") == "double" and donor_var.get("type") == "ptr":
+                extracted = _extract_scalar_if_possible(donor_var)
+                if extracted is not None:
+                    clone_sgo["variables"][i] = {
+                        "name": var["name"], "type": "double", "value": extracted
+                    }
+                    changed = True
+                continue
+            # Any other type mismatch (e.g. string vs ptr) has no safe
+            # extraction — skip as before, leaving the original value.
+            continue
     return changed
 
 
@@ -205,6 +233,30 @@ def randomize_full_roster(
     tiers = settings["tiers"]
     behavior_fields = settings["swappable_behavior_fields"]
     higher_is_better = settings["stats_higher_is_better"]
+
+    # Cache for the Engineer-sound safety check below — avoids
+    # reloading and re-checking the same cluster representative's
+    # file repeatedly for every recipient weapon that shares a
+    # category with it.
+    _engineer_sound_cache: dict = {}
+
+    def _is_engineer_sound_donor(cluster: dict) -> bool:
+        sgo_path = cluster["representative"]["sgo_path"]
+        if sgo_path in _engineer_sound_cache:
+            return _engineer_sound_cache[sgo_path]
+        donor_filename = sgo_path_to_filename(sgo_path)
+        donor_data = weapon_json_loader(donor_filename)
+        result = False
+        if donor_data:
+            fire_se = get_var(donor_data, "FireSe")
+            if fire_se and fire_se.get("type") == "ptr":
+                for item in fire_se.get("value", []):
+                    if isinstance(item, dict) and item.get("type") == "string":
+                        if "Engineer" in str(item.get("value") or ""):
+                            result = True
+                        break
+        _engineer_sound_cache[sgo_path] = result
+        return result
     lower_is_better = settings["stats_lower_is_better"]
 
     output_sgo_by_filename: Dict[str, dict] = {}
@@ -256,10 +308,35 @@ def randomize_full_roster(
             # to EACH OTHER, so grenade-side variety isn't lost either —
             # only this one specific direction is blocked.
             own_class = get_scalar(own_sgo, "xgs_scene_object_class") or ""
+            # Engineer-sound safety rule, added after a real, confirmed
+            # crash traced to a specific mechanic, not donor origin
+            # generally (an earlier enemy-donor-blanket exclusion was
+            # tried and reverted, since real gameplay showed most
+            # enemy-donor transplants work fine). The actual signal:
+            # SecondaryFire_Type=3 is used by TWO distinct, unrelated
+            # weapon families sharing that raw value — Ranger's own
+            # legitimate thrown-bomb series (FireSe: "weapon_Ranger_GL_
+            # ...", confirmed safe, real player mechanic) and the
+            # "Limpet" remote-detonation family (FireSe: "weapon_
+            # Engineer_BOM_...", confirmed to crash on fire). The
+            # SecondaryFire_Type value alone can't distinguish these —
+            # only the FireSe sound tag can. Blocks the "Engineer"
+            # family from donating to non-"Engineer" recipients, while
+            # leaving Ranger's own bomb variety, and everything else,
+            # completely unrestricted.
+            own_fire_se = get_var(own_sgo, "FireSe")
+            own_is_engineer_sound = False
+            if own_fire_se and own_fire_se.get("type") == "ptr":
+                for item in own_fire_se.get("value", []):
+                    if isinstance(item, dict) and item.get("type") == "string":
+                        if "Engineer" in str(item.get("value") or ""):
+                            own_is_engineer_sound = True
+                        break
             compatible_clusters = [
                 c for c in cat_info["clusters"]
-                if "Throw" not in str(c["fingerprint"].get("xgs_scene_object_class") or "")
-                or "Throw" in own_class
+                if ("Throw" not in str(c["fingerprint"].get("xgs_scene_object_class") or "")
+                    or "Throw" in own_class)
+                and (own_is_engineer_sound or not _is_engineer_sound_donor(c))
             ]
             if compatible_clusters:
                 chosen_cluster = rng.choice(compatible_clusters)
